@@ -1,0 +1,7 @@
+daml-ha1.0:  Decentralized asynchronous machine learning - heterogenous aware 1.0
+1. use coordinator to dynamically change the communication topology
+2. each node pull parameters from another one node each clock according to the communication policy
+3. each node measure the iteration time and report to coordinator which accounts for generating communication policy
+4. without data in /examples/pytorch-cifar/data
+5. need run command to generate training dataset like 'python3 cifar10-modification.py --remove-labels 1,2,3'
+6. start coordinator  -> start workers
