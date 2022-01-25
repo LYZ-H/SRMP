@@ -51,12 +51,14 @@ class CIFAR10_read(VisionDataset):
     }
 
     def __init__(self, root, train=True, transform=None, target_transform=None,
-                 download=False):
+                 download=False, workers=3, wid=0):
 
         super(CIFAR10_read, self).__init__(root, transform=transform,
                                       target_transform=target_transform)
 
         self.train = train  # training set or test set
+        self.workers = workers
+        self.wid = wid
 
         if download:
             self.download()
@@ -72,23 +74,40 @@ class CIFAR10_read(VisionDataset):
 
         self.data = []
         self.targets = []
+        
 
         # now load the picked numpy arrays
-        for file_name, checksum in downloaded_list:
-            file_path = os.path.join(self.root, self.base_folder, file_name)
-            with open(file_path, 'rb') as f:
-                if sys.version_info[0] == 2:
-                    entry = pickle.load(f)
-                else:
-                    entry = pickle.load(f, encoding='latin1')
-                self.data.append(entry['data'])
-                if 'labels' in entry:
-                    self.targets.extend(entry['labels'])
-                else:
-                    self.targets.extend(entry['fine_labels'])
+        # for file_name, checksum in downloaded_list[0:to]:
+        #     file_path = os.path.join(self.root, self.base_folder, file_name)
+        #     with open(file_path, 'rb') as f:
+        #         if sys.version_info[0] == 2:
+        #             entry = pickle.load(f)
+        #         else:
+        #             entry = pickle.load(f, encoding='latin1')
+        #         self.data.append(entry['data'])
+        #         if 'labels' in entry:
+        #             self.targets.extend(entry['labels'])
+        #         else:
+        #             self.targets.extend(entry['fine_labels'])
+                  
+        file_name, checksum = downloaded_list[wid-1]
+        file_path = os.path.join(self.root, self.base_folder, file_name)
+        with open(file_path, 'rb') as f:
+            if sys.version_info[0] == 2:
+                entry = pickle.load(f)
+            else:
+                entry = pickle.load(f, encoding='latin1')
+            self.data.append(entry['data'])
+            if 'labels' in entry:
+                self.targets.extend(entry['labels'])
+            else:
+                self.targets.extend(entry['fine_labels'])
 
+        
+        
         self.data = np.vstack(self.data).reshape(-1, 3, 32, 32)
         self.data = self.data.transpose((0, 2, 3, 1))  # convert to HWC
+        
 
         self._load_meta()
 
@@ -140,7 +159,7 @@ class CIFAR10_read(VisionDataset):
 
     def download(self):
         if self._check_integrity():
-            print('Files already downloaded and verified')
+            #print('Files already downloaded and verified')
             return
         download_and_extract_archive(self.url, self.root, filename=self.filename, md5=self.tgz_md5)
 

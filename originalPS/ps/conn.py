@@ -17,421 +17,930 @@
 #       Initiating a fetch request to a random peer each time
 #
 """Async Client/Server implementation."""
-import sys
-import threading
 from copy import deepcopy
 import logging
-from threading import Thread, Lock
-from queue import Queue
-import select
-import socketserver
 import socket
-import random
-import numpy as np
+from collections import OrderedDict, deque
 import time
-
-from .messaging import send_message, recv_message, MessageError
+import gc
+import queue
+import struct
+import threading
+import multiprocessing
+import posix_ipc
+from operator import xor
+import _thread
+import queue
 
 LOGGER = logging.getLogger(__name__)
 
-MESSAGE_TYPE_FETCH_PARAMETERS = 1
-MESSAGE_TYPE_UPDATED_PARAMETERS = 2
-
-queue_lock = Lock()
-queue = Queue(100)
+from .messages import P2MMSG, P2PMSG
 
 
-class Myserver(socketserver.BaseRequestHandler):
+class RxProtocol:
+    """
+    handle received SYN, CHUNK, and FIN messages/datagrams
+    """
+    def __init__(self,
+                 rx_queue,
+                 channel_name=None,
+                 bw_in_kbps=800 * 1024,
+                 acceptable_loss_rate=0.0,
+                 feedback = 1):
+        # def __init__(self, rx_queue, source_peer, channel_name=None, bw_in_kbps=800 * 1024):
+        # all packets assgined with the same local port are handled by this protocol/protocol
+        #super().__init__()
+        self.rx_queue = rx_queue
+        self.buf = {}
+        self.acceptable_loss_rate = acceptable_loss_rate
+        # self.source_peer = source_peer
 
-    def handle(self):
-        client_sock = self.request
-        while True:
-            try:
-                # The socket is blocking
-                LOGGER.debug("RxThread: receiving message fd=%d", client_sock.fileno())
-                message_type, peer_message, peer_payload = recv_message(client_sock)
-                assert message_type == MESSAGE_TYPE_FETCH_PARAMETERS or message_type == MESSAGE_TYPE_UPDATED_PARAMETERS
-                rev_msg = (peer_message, peer_payload)
-                with queue_lock:
-                    queue.put(rev_msg)
-                # response to the client
-                send_message(client_sock, message_type)
+        self.channel_name = channel_name
+        self.sem = posix_ipc.Semaphore(channel_name,
+                                       flags=posix_ipc.O_CREAT,
+                                       initial_value=1)
+        self.bw_in_kbps = bw_in_kbps
+        self.i = 0
 
-            except (BrokenPipeError, ConnectionResetError):
-                LOGGER.warning("Other end had a timeout, socket closed")
-                client_sock.close()
-                break
+        self.fb_count = 1
+        self.max_chunk_seq = 0
+        
+        self.feedback = feedback
 
-            except:
-                LOGGER.exception("Error handling request (closing socket, client will retry)")
-                client_sock.close()
-                break
+        # TODO: (maybe) support dynamicall join and leave in the future
+        """
+        self.joined = False
+        self.join_sent_time = None
+        self.mcast_source = None
+        self.join_timeout = 2
+        """
 
+    def __del__(self):
+        self.sem.unlink()
+        #self.sem.close()
 
-class RxThread(Thread):
-    def __init__(self, bind_host, bind_port, socket_timeout_ms):
-        super().__init__()
+    def connection_made(self, transport, transport_one):
+        LOGGER.info('Protocol started!')
+        self.transport = transport
+        self.transport_one = transport_one
 
-        LOGGER.info("Starting RxThread. listening on %s:%d...", bind_host, bind_port)
-        self.bind_host = bind_host
-        self.bind_port = bind_port
-        self.socket_timeout_ms = socket_timeout_ms
-        self.lock = Lock()
+    def get_cur_time(self):
+        return time.time()
 
-    def run(self):
-        LOGGER.info("RxThread: run()")
+    def send_join(self):
+        msg = P2MMSG()  # join
+        self.sendto(msg.tobytes(), self.source_peer)
+        self.join_sent_time = self.get_cur_time()
+
+    def check_join(self):
+        if self.joined:
+            return
+        cur_time = self.get_cur_time()
+        if self.join_sent_time + self.join_timeout < cur_time:
+            self.join_sent_time = cur_time
+            self.send_join()
+
+    def sendto(self, data, addr):
         try:
-            while True:
-                server = socketserver.ThreadingTCPServer((self.bind_host, self.bind_port), Myserver)
-                print("socket server start.....")
-                server.serve_forever()
+            if self.channel_name is None:
+                return self.transport.sendto(data, addr)
+            else:
+                self.sem.acquire()
+                self.transport.sendto(data, addr)
+                self.sem.release()
         except Exception as e:
-            print('===>Rxthead exception:')
-            print(str(e))
+            self.transport.sendto(data, addr)
 
-        LOGGER.info("TxThread: Exiting...")
+    def check_completed(self, addr):
+        if self.buf[addr] != None:
+            gr = self.buf[addr]['received'] / self.buf[addr]['total']
+            print("### {} {}".format(self.channel_name, gr))
 
-    def fetch_wait(self):
-        """fetch a model. if not received, wait"""
-        peer_message, peer_payload = queue.get(block=True)
+    def bitwise_xor_bytes(self, a, b):
+        result_int = int.from_bytes(a, byteorder="big") ^ int.from_bytes(
+            b, byteorder="big")
+        return result_int.to_bytes(max(len(a), len(b)), byteorder="big")
 
-        return peer_message, peer_payload
+    def datagram_received(self, data, addr):
 
-    def shutdown(self):
-        # TODO(guyz): Implement using eventfd...
-        raise NotImplementedError
-
-
-# This has the effect of holding 16MB per socket. Since each node holds
-# 2 sockets per peer, each node will need (16MB * 2 * nodes) of available
-# memory, on a 36 nodes cluster, that equals about 1.2GB
-
-TCP_SOCKET_BUFFER_SIZE = 8 * 1024 * 1024
-
-
-def _create_tcp_socket():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP_SOCKET_BUFFER_SIZE)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP_SOCKET_BUFFER_SIZE)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    return sock
-
-
-class RxThread_old(Thread):
-    def __init__(self, bind_host, bind_port, socket_timeout_ms):
-        super().__init__()
-
-        LOGGER.info("Starting RxThread. listening on %s:%d...", bind_host, bind_port)
-        self.bind_host = bind_host
-        self.bind_port = bind_port
-        self.socket_timeout_ms = socket_timeout_ms
-        self.lock = Lock()
-        self._queue = Queue(100)
-        # Create server socket
-        self.sock = _create_tcp_socket()
-        self.sock.bind((bind_host, bind_port))
-        self.sock.listen(10)
-
-        # Epoll
-        self.fds = {}
-        self.efd = select.epoll()
-        self._register_fd(self.sock.fileno(), select.EPOLLIN, self._handle_new_connection, self.sock)
-
-    def _register_fd(self, fd, events, cb, arg):
-        LOGGER.debug("RxThread: registering fd=%d", fd)
-        assert fd not in self.fds, "fd already registered %d" % fd
-        self.fds[fd] = (cb, arg)
-        self.efd.register(fd, events)
-
-    def _rearm_fd(self, fd, events):
-        LOGGER.debug("RxThread: rearming fd=%d", fd)
-        assert fd in self.fds, "fd not registered %d" % fd
-        self.efd.modify(fd, events)
-
-    def _unregister_fd(self, fd):
-        LOGGER.debug("RxThread: unregistering fd=%d", fd)
-        assert fd in self.fds, "fd not registered %d" % fd
-        self.efd.unregister(fd)
-        del self.fds[fd]
-
-    def _handle_request(self, client_sock):
+        cur_time = self.get_cur_time()
         try:
-            # The socket is blocking
-            LOGGER.debug("RxThread: receiving message fd=%d", client_sock.fileno())
-            message_type, peer_message, peer_payload = recv_message(client_sock)
-            assert message_type == MESSAGE_TYPE_FETCH_PARAMETERS or message_type == MESSAGE_TYPE_UPDATED_PARAMETERS
-            rev_msg = (peer_message, peer_payload)
-            self._queue.put(rev_msg)
-            # response to the client
-            send_message(client_sock, message_type)
+            msg = P2MMSG(frombuffer=data)
+            # msg: is_SYN, is_FIN, is_CHUNK, pkt_index, chunk_seq
+        except Exception as e:
+            print('a22' + str(e))
+            LOGGER.info('message decode error mult: %s', str(e))
+            return
 
-        except (BrokenPipeError, ConnectionResetError):
-            LOGGER.warning("Other end had a timeout, socket closed")
-            self._unregister_fd(client_sock.fileno())
-            client_sock.close()
+        reply = None
+        reply_fin = None
+        reply_feedback = None
 
-        except:
-            LOGGER.exception("Error handling request (closing socket, client will retry)")
-            self._unregister_fd(client_sock.fileno())
-            client_sock.close()
+        if addr not in self.buf and msg.mtype == 2:
+            chunks = [None for _ in range(msg.total_chunk)]
+            self.buf[addr] = dict(
+                chunks=chunks,
+                clock=msg.clock,
+                received=0,
+                total=msg.total_chunk,
+                start_time=cur_time,
+                max_received_chunk_seq=-1,
+                lost_chunks=set(),
+            )
+            # TODO: count the number of received chunk
+        elif addr not in self.buf and msg.mtype == 6:
+            reply_fin = P2PMSG(peer=self.channel_name,
+                              mtype=P2PMSG.FIN_ACK_MUL,
+                              clock=int(time.time()))
 
-    def _handle_client_event(self, events, conn):
-        fd = conn.fileno()
+        if addr in self.buf:
+            ref = self.buf[addr]
+            if self.buf[addr]['received'] / self.buf[addr][
+                    'total'] >= 1 - self.acceptable_loss_rate and msg.mtype != 6:
+                reply = P2PMSG(
+                    peer=self.channel_name,
+                    mtype=P2PMSG.PRE_FIN,
+                )
 
-        # Hang-up
-        if (events & select.EPOLLHUP) or (events & select.EPOLLERR):
-            LOGGER.info("closed connection. fd=%d", fd)
-            self._unregister_fd(fd)
-            conn.close()
+            elif msg.mtype == 2:
+                chunk_data = msg.chunk_data
+                chunk_seqs = msg.chunk_seqs
+                chunk_seq = msg.chunk_seq
 
-        # Read
-        elif events & select.EPOLLIN:
-            self._handle_request(conn)
-        else:
-            raise Exception("Unrecognized event=%d, fd=%d" % (events, fd))
+                if ref['chunks'][chunk_seq] is None:
+                    ref['chunks'][chunk_seq] = chunk_data
+                    ref['received'] += 1
+                if chunk_seq in ref['lost_chunks']:
+                    ref['lost_chunks'].discard(chunk_seq)
+                else:
+                    ref['lost_chunks'].update(
+                        range(ref['max_received_chunk_seq'] + 1,
+                              msg.chunk_seq))
+                reply = P2PMSG(peer=self.channel_name,
+                              mtype=P2PMSG.CHUNK_ACK,
+                              seq=msg.seq,
+                              chunk_seq=chunk_seq)
 
-    def _handle_new_connection(self, events, _):
-        assert events == select.EPOLLIN
+                if self.feedback == 1:
+                    if msg.chunk_seq > self.max_chunk_seq:
+                        self.max_chunk_seq = msg.chunk_seq
+                    # if msg.chunk_seq >= (self.max_chunk_seq / 4 * 3) and msg.chunk_seq // 1000 == self.fb_count:
+                    if msg.chunk_seq >= self.max_chunk_seq and msg.chunk_seq % 1000 == 0:
+                        uncover = []
+                        for i in range(0, self.max_chunk_seq):
+                            if ref['chunks'][i] is not None:
+                                # chunk_data = xor(chunk_data, ref['chunks'][i])
+                                chunk_data = self.bitwise_xor_bytes(
+                                    chunk_data, ref['chunks'][i])
+                            else:
+                                uncover.append(i)
+                        if len(uncover) == 1:
+                            chunk_seq = uncover[0]
+                            if ref['chunks'][chunk_seq] is None:
+                                #ref['chunks'][msg.chunk_seq] = msg.chunk_data
+                                ref['chunks'][chunk_seq] = chunk_data
+                                ref['received'] += 1
+                                if chunk_seq in ref['lost_chunks']:
+                                    ref['lost_chunks'].discard(chunk_seq)
+                                else:
+                                    ref['lost_chunks'].update(
+                                        range(ref['max_received_chunk_seq'] + 1,
+                                            msg.chunk_seq))
+                            else:
+                                LOGGER.debug(
+                                    '# Debug, duplicated chunk... {0} from peer {1}'
+                                    .format(msg.chunk_seq, addr))
+                        elif len(uncover) >= 40:
+                            print("x")
+                            chunk_seqs = uncover
+                            reply_feedback = P2PMSG(
+                                peer=self.channel_name,
+                                mtype=P2PMSG.CHUNK_FEEDBACK,
+                                seq=msg.seq,
+                                chunk_seqs=chunk_seqs,
+                                chunk_seqs_len=len(chunk_seqs),
+                                total_chunk=msg.total_chunk,
+                                last_received_chunk_seq=chunk_seq,
+                                clock=int(time.time()),
+                                receiver_id=0)
+                            if self.channel_name == 'w2':
+                                addr = ('10.0.0.1', 42000)
+                                self.sendto(reply_feedback.tobytes(), addr)
+                            elif self.channel_name == 'w3':
+                                addr = ('10.0.0.1', 43000)
+                                self.sendto(reply_feedback.tobytes(), addr)
+                            elif self.channel_name == 'w4':
+                                addr = ('10.0.0.1', 44000)
+                                self.sendto(reply_feedback.tobytes(), addr)
+                            elif self.channel_name == 'w5':
+                                addr = ('10.0.0.1', 45000)
+                                self.sendto(reply_feedback.tobytes(), addr)
 
-        (client_sock, address) = self.sock.accept()
-        LOGGER.info("%s connected. fd=%d", address, client_sock.fileno())
-        client_sock.settimeout(self.socket_timeout_ms)
-        self._register_fd(client_sock.fileno(),
-                          select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR,
-                          self._handle_client_event, client_sock)
+                        self.fb_count += 1
+
+                self.buf[addr] = ref
+
+            elif msg.mtype == 6:
+                if addr in self.buf:
+                    self.check_completed(addr)
+                    self.rx_queue.put(self.buf.pop(addr))
+                    gc.collect()
+                reply_fin = P2PMSG(peer=self.channel_name,
+                                  mtype=P2PMSG.FIN_ACK_MUL,
+                                  clock=int(time.time()))
+
+                self.fb_count = 1
+                self.max_chunk_seq = 0
+
+        if self.channel_name == 'w1':
+            addr = ('10.0.0.1', 41000)
+            if reply_fin is not None:
+                self.sendto(reply_fin.tobytes(), addr)
+            else:
+                self.sendto(reply.tobytes(), addr)
+            self.i += 1
+        elif self.channel_name == 'w2' and reply_fin is not None:
+            addr = ('10.0.0.1', 42000)
+            self.sendto(reply_fin.tobytes(), addr)
+        elif self.channel_name == 'w3' and reply_fin is not None:
+            addr = ('10.0.0.1', 43000)
+            self.sendto(reply_fin.tobytes(), addr)
+        elif self.channel_name == 'w4' and reply_fin is not None:
+            addr = ('10.0.0.1', 44000)
+            self.sendto(reply_fin.tobytes(), addr)
+        elif self.channel_name == 'w5' and reply_fin is not None:
+            addr = ('10.0.0.1', 45000)
+            self.sendto(reply_fin.tobytes(), addr)
+
+
+
+class RxThread(threading.Thread):
+    """
+    listen on a port to receive chunks
+    """
+    def __init__(self,
+                 mcast_grp,
+                 mcast_port,
+                 channel_name=None,
+                 source_peer=None,
+                 bw_in_kbps=800 * 1024,
+                 socket_one=None,
+                 acceptable_loss_rate=0.0,
+                 feedback = 1):
+        super().__init__()
+        #self.source_peer = source_peer
+        self.mcast_grp = mcast_grp
+        self.mcast_port = mcast_port
+        # TODO: can setup multiple socket if needed.
+        self.rx_queue = queue.Queue()
+        self.sock_one = socket_one
+        self.acceptable_loss_rate = acceptable_loss_rate
+        self.feedback = feedback
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                      socket.IPPROTO_UDP)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # on this port, receives ALL multicast groups
+            self.sock.bind(('', self.mcast_port))
+        except Exception as e:
+            print('a3' + str(e))
+            LOGGER.info('RxThread ... init error: %s', str(e))
+        self.channel_name = channel_name
+        self.bw_in_kbps = bw_in_kbps
+        self.protocol = RxProtocol(
+            rx_queue=self.rx_queue,
+            channel_name=self.channel_name,
+            bw_in_kbps=self.bw_in_kbps,
+            acceptable_loss_rate=self.acceptable_loss_rate,
+            feedback = self.feedback)
+        self.protocol.connection_made(self.sock, self.sock_one)
+        self.running = True
+        LOGGER.info("RxThread starts to receve data..... at %s",
+                    str(self.sock.getsockname()))
+
+    def __del__(self):
+        self.sock.setsockopt(
+            socket.SOL_IP, socket.IP_DROP_MEMBERSHIP,
+            socket.inet_aton(self.mcast_grp) + socket.inet_aton('0.0.0.0'))
+        #print('# Done!')
 
     def run(self):
-        LOGGER.info("RxThread: run()")
-        try:
-            while True:
-                # Blocking
-                events = self.efd.poll()
-                for fd, events in events:
-                    cb, args = self.fds[fd]
-                    cb(events, args)
-        finally:
-            sock_fd = self.sock.fileno()
-            fds = list(self.fds.keys())
-            for fd in fds:
-                if fd != sock_fd:
-                    _, sock = self.fds[fd]
-                    self.efd.unregister(fd)
-                    sock.close()
-            self.efd.unregister(sock_fd)
-            self.sock.close()
-            self.efd.close()
-
-            LOGGER.info("TxThread: Exiting...")
+        LOGGER.info('rx is running now')
+        mreq = struct.pack("4sl", socket.inet_aton(self.mcast_grp),
+                           socket.INADDR_ANY)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        #self.protocol.send_join()
+        # TODO: maybe support dynamically join in the future
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(P2MMSG.MAX_SIZE)
+                addr = ('10.0.0.1', 40000)
+                self.protocol.datagram_received(data, addr)
+                # set and check timeout
+            except Exception as e:
+                print('a4' + str(e))
+                pass
+            """
+            if not self.protocol.joined:
+                self.protocol.check_join()
+            """
 
     def fetch_wait(self):
         """fetch a model. if not received, wait"""
-        peer_message, peer_payload = self._queue.get(block=True)
-        return peer_message, peer_payload
+        ref = self.rx_queue.get()
+        return ref
 
     def shutdown(self):
-        # TODO(guyz): Implement using eventfd...
-        raise NotImplementedError
+        self.running = False
 
 
 #
-# Client
+# Sender
 #
 
-FLOW_CONTROL_MIN_SCORE = 10
-FLOW_CONTROL_MAX_SCORE = 1000
-FLOW_CONTROL_INC_SCORE = 0
-FLOW_CONTROL_DEC_SCORE = 0
+packets = queue.Queue()
 
 
-class WorkerConn:
-    """Describes a peer's state in the cluster."""
+class TxProtocol:
+    SYN = 1
+    SENDING = 2
+    FIN = 3
+    DRAINING = 4
+    COMPLETED = 5
 
-    def __init__(self, name, host, port):
-        self.name = name
-        self.host = host
-        self.port = port
-        self.flow_control_score = FLOW_CONTROL_MAX_SCORE
-        self.pull_time = np.inf
+    CC_STATE_SLOW_START = 1
+    CC_STATE_CONGESTION_AVOIDANCE = 2
 
-        # Lazy connection
-        self.connected = False
-        self.sock = None
+    def __init__(
+            self,
+            tx_queue,
+            receivers,
+            clock,
+            chunks,
+            chunk_dtype=P2MMSG.FLOAT32,
+            init_cwnd=100,
+            min_cwnd=50,
+            max_cwnd=1e9,
+            init_rto=1,
+            min_rto=1e-2,
+            init_sshreshold=2**30,
+            min_sshreshold=100,
+            max_rate_in_mbps=2e3,
+            tx_name=None,
+            rx_name=None,
+            acceptable_loss_rate=0.0,
+            # note that, because of the error of estimation,
+            # the acceptable loss rate should be slightly larger than the loss rate of the channel.
+            channel_name=None,
+            bw_in_kbps=8 * 8 * 1024,
+            type=0,
+            is_udp=0,
+            **param):
+
+        super().__init__()
+        self.receivers = receivers
+        self.receivers_list = list(self.receivers)
+        self.next_rid_index = -1
+
+        self.tx_queue = tx_queue
+        self.channel_name = channel_name
+        self.bw_in_kbps = bw_in_kbps
+        self.sem = posix_ipc.Semaphore(channel_name,
+                                       flags=posix_ipc.O_CREAT,
+                                       initial_value=1)
+        if self.sem.value == 0:
+            self.sem.release()
+
+        self.type = type
+        self.is_udp = is_udp
+        self.tx_name = tx_name
+        self.rx_name = rx_name
+
+        self.clock = clock
+        self.chunk_dtype = chunk_dtype
+        self.chunks = chunks
+
+        # -------------------------------
+        # cwnd, sshreshold, and cc_state can be reused for sequential transmistion tasks
+        # --------------------------
+        self.cwnd = init_cwnd
+        self.sshreshold = init_sshreshold
+
+        self.cc_state = self.CC_STATE_SLOW_START
+
+        # self.init_cwnd = init_cwnd
+        self.min_cwnd = min_cwnd
+        self.max_cwnd = max_cwnd
+        self.max_rate_in_mbps = max_rate_in_mbps
+        self.max_rate_in_chunk_per_second = self.max_rate_in_mbps * 1e8 / 8 / P2MMSG.AVG_SIZE
+
+        self.connection_stage = self.SENDING
+        # self.init_sshreshold = init_sshreshold
+        self.min_sshreshold = min_sshreshold
+        self.rto = init_rto
+        self.min_rto = min_rto
+
+        # ------------------------------
+        self.LOSS_DETECT_THRESHOLD = 3
+        self.last_cutdown_time = -1
+
+        self.sent_yet_unacked = OrderedDict()
+        self.to_resend = OrderedDict()
+        self.next_chunk_seq = 0
+        self.total_chunk_num = len(self.chunks)
+
+        self.pkt_index = 0
+        # self.tx_tokens = Queue()
+        # self.tx_is_blocked = False
+        self.rtt = None
+        self.rttdev = 0
+        self.rtt_alpha = 0.125
+        self.rtt_1_alpha = 1 - self.rtt_alpha
+        self.rtt_beta = 0.25
+        self.rtt_1_beta = 1 - self.rtt_beta
+
+        self.fast_draining_factor = 5
+        self.perf_metrics = dict(resend_cnt=0,
+                                 timeout_cnt=0,
+                                 start_time=time.time(),
+                                 chunk_num=len(self.chunks))
+        self.last_receved_msg = None
+        self.cc_state_trace = []
+        self.last_fin_sent_time = -1
+
+        self.acceptable_loss_rate = acceptable_loss_rate
+        self.total_received_chunk_from_syn = 0
+        self.estimated_loss_in_last_rtt = 0
+        self.estimated_loss_reset_time = 0
+        self.syn_time = 0
+
+        self.met_congestion = False
+        self.loss_count = 0
+        self.total_loss = 0
+
+        self.fin_arr = [False] * 5
+
+        self.total_received = 0
+
+        self.packets = queue.Queue()
+        self.met_err = False
+
+        self.rec = 0
+
+        self.sended = []
+
+        self.feedback_seq = {}
+
+        self.chunks_to_resend = set()
+
+        self.recv = set()
+
+    def update_rtt(self, rtt_sample):
+        # http://blough.ece.gatech.edu/4110/TCPTimers.pdf
+        if self.rtt is None:
+            self.rtt = rtt_sample
+        e = rtt_sample - self.rtt
+        self.rtt += self.rtt_alpha * e
+        # """
+        ee = e if e > 0 else -e
+        self.rttdev += self.rtt_beta * (ee - self.rttdev)
+        self.rto = max(self.min_rto, self.rtt + 4 * self.rttdev)
+        self.transport.settimeout(self.rto)
+        # """
+
+    def connection_made(self, transport, addr=None):
+        LOGGER.info('Connected!')
+        self.transport = transport
+        self.addr = addr
+        self.transmit()
+
+    def __del__(self):
+        self.sem.unlink()
+        # self.sem.close()
+
+    def get_cur_time(self):
+        return time.time()
+
+    def sendto(self, data, addr):
+        try:
+            if self.channel_name is None:
+                return self.transport.sendto(data, addr)
+            else:
+                self.sem.acquire()
+                assert self.sem.value == 0
+
+                self.transport.sendto(data, addr)
+                self.sem.release()
+        except Exception as e:
+            if self.sem.value == 0:
+                self.sem.release()
+            self.sendto(data, addr)
+
+    def handle_ack_timeout(self):
+        self.perf_metrics['timeout_cnt'] += 1
+        self.sshreshold = max(self.min_sshreshold, self.cwnd / 2)
+        self.cwnd = self.min_cwnd
+        self.met_congestion = True
+        try:
+            for seq, v in self.sent_yet_unacked.items():
+                self.to_resend[seq] = v
+                # if self.tx_is_blocked:
+                #    self.tx_tokens.put(1)
+        except Exception as e:
+            pass
+        self.sent_yet_unacked.clear()
+        self.transmit()
+
+    def chunk_to_feedback(self):
+
+        total_peer = len(self.feedback_seq.keys())
+        chunk_total_feedback = set()
+        for chunks in self.feedback_seq.values():
+            chunk_total_feedback.update(chunks)
+
+        self.chunks_to_resend = set()
+        print(total_peer)
+        for chunk in chunk_total_feedback:
+            i = 0
+            for chunks in self.feedback_seq.values():
+                if chunk in chunks:
+                    i += 1
+                if i >= total_peer - 4:
+                    self.chunks_to_resend.add(chunk)
+        for i, seq in enumerate(self.chunks_to_resend):
+            if i % 50 == 0:
+                time.sleep(0.001)
+            msg = P2MMSG(
+                mtype=P2MMSG.CHUNK,
+                clock=int(time.time()),
+                total_chunk=self.total_chunk_num,
+                receiver_id=0,
+                seq=self.pkt_index,
+                chunk_seq=seq,
+                chunk_data=self.chunks[seq])
+            self.sendto(msg.tobytes(), self.addr)
+
+    def datagram_received(self, data, addr):
+        cur_time = self.get_cur_time()
+        try:
+            msg = P2PMSG(frombuffer=data)
+        except Exception as e:
+            print('a2' + str(e))
+            LOGGER.info('message decode error mult: %s', str(e))
+            return
+
+        if self.connection_stage == self.SENDING and msg.peer == 'w1':
+
+            if msg.mtype == 9:
+                self.chunk_to_feedback()
+                self.connection_stage = self.FIN
+                self.perf_metrics['finish_time'] = cur_time
+            elif msg.mtype == 4:
+
+                self.update_rtt_cc_cwnd_and_buf(msg)
+
+        elif self.connection_stage == self.SENDING:
+            if msg.CHUNK_FEEDBACK:
+                if msg.peer not in self.feedback_seq:
+                    self.feedback_seq[msg.peer] = set()
+                self.feedback_seq[msg.peer].update(set(msg.chunk_seqs))
+
+        elif self.connection_stage == self.FIN:
+            if msg.FIN_ACK_MUL and msg.peer != 1:
+
+                self.fin_arr[int(msg.peer[1:]) - 1] = True
+
+                if not False in self.fin_arr:
+                    self.connection_stage = self.COMPLETED
+
+        elif self.connection_stage == self.COMPLETED:
+            pass
+        else:
+            LOGGER.info('error meesage: %s', str(msg))
+        if (self.connection_stage == self.SENDING
+                and msg.peer == 'w1') or self.connection_stage != self.SENDING:
+            self.transmit()
+
+    def get_chunk_to_send(self):
+
+        if self.next_chunk_seq < self.total_chunk_num:
+            seq = self.next_chunk_seq
+            chunk = self.chunks[seq]
+            self.next_chunk_seq += 1
+        elif len(self.to_resend) > 0:
+            seq, v = self.to_resend.popitem(last=False)
+            chunk = v['chunk']
+        elif 0 < len(self.sent_yet_unacked) < self.fast_draining_factor:
+            seq, v = self.sent_yet_unacked.popitem(last=False)
+            chunk = v['chunk']
+        elif len(self.sent_yet_unacked) > 0:
+            seq, v = self.sent_yet_unacked.popitem(last=False)
+            chunk = v['chunk']
+        else:
+            seq, chunk = None, None
+        self.sended.append(seq)
+        return seq, chunk
+
+    def update_rtt_cc_cwnd_and_buf(self, msg):
+        self.total_received += 1
+        cur_time = self.get_cur_time()
+        acked_chunk_seq = msg.chunk_seq
+        if acked_chunk_seq not in self.recv:
+            self.recv.add(acked_chunk_seq)
+        v = self.to_resend.pop(acked_chunk_seq,
+                               None) or self.sent_yet_unacked.pop(
+                                   acked_chunk_seq, None)
+
+        if v is None:
+            return None
+
+        if msg.seq == v['pkt_seq']:
+            rtt_sample = cur_time - v['sent_time']
+            self.update_rtt(rtt_sample)
+        # detect packet loss
+        newly_to_resend = []
+        for seq, v in self.sent_yet_unacked.items():
+            if seq > acked_chunk_seq:
+                break
+            v['reorder_cnt'] += 1
+            if v['reorder_cnt'] >= self.LOSS_DETECT_THRESHOLD:
+                newly_to_resend.append(seq)
+        for seq in newly_to_resend:
+            try:
+                v = self.sent_yet_unacked.pop(seq)
+                self.to_resend[seq] = v
+            except KeyError:
+                pass
+
+        self.total_received_chunk_from_syn += 1
+        # packet loss
+        self.met_congestion = False
+        resent_num = len(newly_to_resend)
+
+        if resent_num > 0:
+            self.perf_metrics['resend_cnt'] += resent_num
+
+            self.estimated_loss_in_last_rtt += resent_num
+            estimated_packets_per_rtt = self.total_received_chunk_from_syn * self.rtt / (
+                cur_time - self.syn_time)
+            estimated_loss_rate = self.estimated_loss_in_last_rtt / (
+                self.estimated_loss_in_last_rtt + estimated_packets_per_rtt)
+
+            if estimated_loss_rate >= self.acceptable_loss_rate:
+                self.met_congestion = True
+
+        if self.estimated_loss_reset_time + self.rtt < cur_time:
+            self.estimated_loss_reset_time = cur_time
+            self.estimated_loss_in_last_rtt = 0
+            # raise ValueError
+
+        # update cc and cwnd
+        if self.cc_state == self.CC_STATE_CONGESTION_AVOIDANCE:
+            self.cwnd += 1
+            if self.met_congestion and self.last_cutdown_time + self.rtt < cur_time:
+                self.sshreshold = self.cwnd / 2
+                self.cwnd = 1
+                self.last_cutdown_time = cur_time
+            elif resent_num > 0:
+                pass  # TODO:
+            else:
+                pass  # TODO:
+
+        elif self.cc_state == self.CC_STATE_SLOW_START:
+            self.cwnd *= 2
+            if self.met_congestion:
+                self.cc_state = self.CC_STATE_CONGESTION_AVOIDANCE
+                self.sshreshold = self.cwnd / 2
+                self.cwnd = 1
+                self.last_cutdown_time = cur_time
+            elif self.cwnd > self.sshreshold:
+                self.cc_state = self.CC_STATE_CONGESTION_AVOIDANCE
+            elif resent_num > 0:
+                pass  # TODO: xxx
+
+        self.cwnd = max(
+            self.min_cwnd,
+            min(self.cwnd, self.max_cwnd,
+                self.rtt * self.max_rate_in_chunk_per_second))
+
+    def get_rid_to_ack(self):
+        if len(self.receivers_list) == 0:
+            return None
+        self.next_rid_index = (1 + self.next_rid_index) % len(
+            self.receivers_list)
+        return self.receivers_list[self.next_rid_index]
+
+    def transmit(self):
+        LOGGER.debug('cwnd: %f, in_flight_pkt: %d, sshreshold: %f', self.cwnd,
+                     len(self.sent_yet_unacked), self.sshreshold)
+
+        msg_num = int(self.cwnd) - len(self.sent_yet_unacked)
+
+        if self.connection_stage == self.SENDING:
+            for _ in range(msg_num):
+                chunk_seq, chunk = self.get_chunk_to_send()
+                # rid = self.get_rid_to_ack()
+                rid = 0
+                if rid is None or chunk_seq is None:
+                    break
+
+                msg = P2MMSG(
+                    mtype=P2MMSG.CHUNK,
+                    clock=int(time.time()),
+                    total_chunk=self.total_chunk_num,
+                    receiver_id=rid,
+                    seq=self.pkt_index,
+                    # chunk_seqs=self.sended,
+                    chunk_seq=chunk_seq,
+                    chunk_data=chunk)
+
+                self.sendto(msg.tobytes(), self.addr)
+
+                cur_time = self.get_cur_time()
+
+                self.sent_yet_unacked[chunk_seq] = dict(
+                    pkt_seq=self.pkt_index,
+                    sent_time=cur_time,
+                    chunk_seqs=msg.chunk_seqs,
+                    chunk=msg.chunk_data,
+                    reorder_cnt=0)
+
+                self.pkt_index += 1
+        elif self.connection_stage == self.FIN:
+            cur_time = self.get_cur_time()
+            # if self.last_fin_sent_time + self.rtt < cur_time:
+            fin_msg = P2MMSG(mtype=P2MMSG.FIN, clock=self.clock)
+            self.sendto(fin_msg.tobytes(), self.addr)
+            # self.last_fin_sent_time = self.get_cur_time()
+
+    def is_active(self):
+        return self.connection_stage != self.COMPLETED
+
+    def get_cur_time(self):
+        return time.time()
+
+    def shutdown(self):
+        self.connection_stage = 'stopped'
+
+    def show_perf(self):
+        LOGGER.info("Flow <%s, %s>, %s", self.tx_name, self.rx_name,
+                    str(self.perf_metrics))
+        LOGGER.info("rtt %f, rttdev %f", self.rtt, self.rttdev)
+        LOGGER.info(
+            'AVG Rate in Mbps %f', self.next_chunk_seq * 8 / 1000 /
+            (self.perf_metrics['finish_time'] -
+             self.perf_metrics['start_time']))
+        # with open('cc_state_trace.txt', 'w') as f:
+        #    print(self.cc_state_trace, file=f)
 
 
-ps_lock = Lock()
+rec_data = queue.Queue()
 
 
-class TxThread(Thread):
-    def __init__(self, socket_timeout_ms, name, is_para, bw):
-        super(TxThread, self).__init__()
-        self.socket_timeout_ms = socket_timeout_ms
-        self._queue = Queue(1)
+class TxThread(threading.Thread):
+    def __init__(self,
+                 name,
+                 mcast_grp,
+                 mcast_port,
+                 local_port=None,
+                 channel_name=None,
+                 bw_in_kbps=800 * 1024,
+                 use_mp=True,
+                 socket_one=None,
+                 acceptable_loss_rate=0,
+                 **param):
+        super().__init__()
         self.peers = {}
-        self.peer_payload = None
-        self.peer_message = None
-        self.error = False
-        self.peers_lock = Lock()
-        self.lock = Lock()
-        self.have_state = False
         self.name = name
-        self.para = is_para
-        self.bw = bw
+        self.mcast_grp = mcast_grp
+        self.mcast_port = mcast_port
+        self.local_port = local_port
+        self.local_host = ''
+        self.param = param
+        self.clock = None
+        self.chunks = None
+        self.use_mp = use_mp
+        self.channel_name = channel_name
+        self.bw_in_kbps = bw_in_kbps
+        self.sock_one = socket_one
+        self.acceptable_loss_rate = acceptable_loss_rate
 
-    def add_peer(self, name, host, port):
-        LOGGER.debug("Adding peer %s (%s:%d)...", name, host, port)
-        conn = WorkerConn(name, host, port)
-        with self.peers_lock:
-            self.peers[name] = conn
+        self.receivers = {}
+        self.next_receiver_id_to_ack = 0
+
+        if self.use_mp:
+            self.proc = multiprocessing.Process
+        else:
+            self.proc = threading.Thread
+
+        # regarding socket.IP_MULTICAST_TTL
+        # ---------------------------------
+        # for all packets sent, after two hops on the network the packet will not
+        # be re-sent/broadcast (see https://www.tldp.org/HOWTO/Multicast-HOWTO-6.html)
+        # self.sock_one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # self.sock_one.bind((self.local_host, self.local_port))
+        MULTICAST_TTL = 10
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                  socket.IPPROTO_UDP)
+
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL,
+                             MULTICAST_TTL)
+
+        # For Python 3, change next line to 'sock.sendto(b"robot", ...' to avoid the
+        # "bytes-like object is required" msg (https://stackoverflow.com/a/42612820)
+        #sock.sendto(b"robot", (MCAST_GRP, MCAST_PORT))
+
+    def add_peer(self, receiver_id, name=None):
+        LOGGER.debug("Adding peer %s (%d)...", name, receiver_id)
+        self.receivers[receiver_id] = dict(name=name)
         LOGGER.debug("peer %s added.", name)
 
-    def remove_peer(self, name):
+    def remove_peer(self, receiver_id, name=None):
         LOGGER.debug("Removing peer %s...", name)
-        with self.peers_lock:
-            peer = self.peers[name]
-            if peer.connected:
-                peer.sock.close()
-            del self.peers[name]
+        del self.receivers[receiver_id]
         LOGGER.debug("peer %s removed.", name)
 
-    def set_current_state(self, state, payload):
-        # We're using a lock because we cannot update the state and payload
-        # While it is sent to a remote peer
-        with self.lock:
-            self.state = deepcopy(state)
-            self.payload = deepcopy(payload)
-            self.have_state = True
+    def recvf(self, protocol, sock):
+        global rec_data
 
-    def check_peers(self):
-        # Make sure the client is connected
-        try:
-            for key in self.peers.keys():
-                peer = self.peers[key]
-                if not peer.connected:
-                    peer.sock = _create_tcp_socket()
-                    peer.sock.settimeout(self.socket_timeout_ms / 1000)
-                    peer.sock.connect((peer.host, peer.port))
-                    peer.connected = True
-                    LOGGER.debug("connected to peer %s successfully", peer.name)
-            return True
-        except ConnectionRefusedError:
-            LOGGER.debug("peer %s not listening yet", peer.name)
-            peer.connected = False
-            return None
-        except:
-            LOGGER.exception("Couldn't connect to peer %s (unrecoverable)", peer.name)
-            # self.remove_peer(peer.name)
-            peer.connected = False
-            return None
+        while protocol.is_active():
+            try:
+                data, addr = sock.recvfrom(P2PMSG.MAX_SIZE)
+            except Exception as e:
+                protocol.handle_ack_timeout()
+                continue
+            rec_data.put([data, addr])
 
-    def ps_sock(self, peer, state):
-        MESSAGE_TYPE = MESSAGE_TYPE_UPDATED_PARAMETERS
+    def start_transfer(self):
+        self.conn_state = {}
+        protocol = TxProtocol(self.tx_queue,
+                              receivers=self.receivers,
+                              clock=self.clock,
+                              chunks=self.chunks,
+                              channel_name=self.channel_name,
+                              bw_in_kbps=self.bw_in_kbps,
+                              acceptable_loss_rate=self.acceptable_loss_rate,
+                              **self.conn_state)
+        lock = _thread.allocate_lock()
+        protocol.connection_made(self.sock,
+                                 addr=(self.mcast_grp, self.mcast_port))
+        self.sock.settimeout(protocol.rto)
 
-        send_message(peer.sock, MESSAGE_TYPE, self.state, self.payload)
+        socket_recs = []
+        for i in range(41000, 46000, 1000):
+            sock_x = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_x.bind(('', i))
+            sock_x.settimeout(protocol.rto)
+            socket_recs.append(sock_x)
 
-    def _flow_control_inc(self, peer):
-        """Increase the flow control score of peer."""
-        peer.flow_control_score = min(peer.flow_control_score + FLOW_CONTROL_INC_SCORE,
-                                      FLOW_CONTROL_MAX_SCORE)
+        t_arr = []
+        for sock in socket_recs:
+            t = threading.Thread(target=self.recvf, args=(
+                protocol,
+                sock,
+            ))
+            t_arr.append(t)
 
-    def _flow_control_dec(self, peer):
-        """Decrease the flow control score of peer."""
-        peer.flow_control_score = max(peer.flow_control_score - FLOW_CONTROL_DEC_SCORE,
-                                      FLOW_CONTROL_MIN_SCORE)
+        for t in t_arr:
+            t.start()
+
+        while protocol.is_active():
+
+            data_r = rec_data.get()
+            protocol.datagram_received(data_r[0], data_r[1])
+        # update self.peers with new init_cwnd and sshrehold
+        # update cwnd=None, sshreshold=None, which would be used for next ....
+        self.conn_state["init_cwnd"] = protocol.cwnd
+        self.conn_state["init_sshreshold"] = protocol.sshreshold
+
+    def send_chunks(self, clock, chunks, show_perf=False):
+        self.clock = clock
+        self.chunks = chunks
+
+        self.transfers = []
+        self.tx_queue = queue.Queue()
+
+        # multicast payload to all the peers
+        transfer = self.proc(target=self.start_transfer)
+
+        transfer.start()
+        # waiting all transfers to complete
+        transfer.join()
+        gc.collect()
+
+        return True
 
     def run(self):
-        LOGGER.info("TxThread: run()")
-        if self.name == 'ps':
-            MESSAGE_TYPE = MESSAGE_TYPE_UPDATED_PARAMETERS
-        else:
-            MESSAGE_TYPE = MESSAGE_TYPE_FETCH_PARAMETERS
-        while True:
-            witem = self._queue.get(block=True)
-            LOGGER.debug("TxThread: have work...")
-            if not witem:
-                LOGGER.info("Exiting TxThread...")
-                break
+        pass
 
-            # make sure all the peers are connected
-            if self.check_peers() == None:
-                self.peer_payload = None
-                self.peer_message = None
-                self._queue.task_done()
-                continue
-            # send payload to all the peers
-            for key in self.peers.keys():
-                peer = self.peers[key]
-                done = False
-                while not done:
-                    if peer is None:
-                        self.peer_payload = None
-                        self.peer_message = None
-                        done = True
-                        continue
-
-                    try:
-                        # make sure the peers' sockets are connected
-                        # and restart connection if failed during communication
-                        if self.check_peers() is None:
-                            continue
-                        # Send a fetch parameters request
-                        LOGGER.debug("TxThread: Sending message fd=%d", peer.sock.fileno())
-                        # send the result
-                        if not self.have_state:
-                            self.peer_payload = None
-                            self.peer_message = None
-                            done = True
-                            continue
-                        else:
-                            with self.lock:
-                                if self.para:
-                                    print('send-' + self.state['name'])
-                                    time.sleep(sys.getsizeof(self.payload) / (self.bw / 8 * 1024 * 1024))
-                                    send_message(peer.sock, MESSAGE_TYPE, self.state, self.payload)
-                                    print('done-' + self.state['name'])
-                                else:
-                                    if self.name == 'ps':
-                                        ps_lock.acquire()
-                                        print('send-' + self.state['name'])
-                                        time.sleep(sys.getsizeof(self.payload) / (self.bw / 8 * 1024 * 1024))
-                                        send_message(peer.sock, MESSAGE_TYPE, self.state, self.payload)
-                                        print('done-' + self.state['name'])
-                                        ps_lock.release()
-                                    else:
-                                        print('send-' + self.state['name'])
-                                        time.sleep(sys.getsizeof(self.payload) / (self.bw / 8 * 1024 * 1024))
-                                        send_message(peer.sock, MESSAGE_TYPE, self.state, self.payload)
-                                        print('done-' + self.state['name'])
-
-                        message_type, self.peer_message, self.peer_payload = recv_message(peer.sock)
-                        assert message_type == MESSAGE_TYPE
-                        done = True
-
-                    except socket.timeout:
-                        LOGGER.warning("TxThread: peer %s timeout, restarting connection...", peer.name)
-                        peer.sock.close()
-                        peer.sock = None
-                        peer.connected = False
-
-                    except:
-                        LOGGER.exception("Error connecting with peer %s.", peer.name)
-                        # self.remove_peer(peer.name)
-                        peer.sock.close()
-                        peer.sock = None
-                        peer.connected = False
-
-            self._queue.task_done()
-
-        LOGGER.info("TxThread: exiting...")
-
-    def fetch_send(self):
-        """Initiate an async fetch_parameters request.
-
-        Selects a random peer and fetch its latest parameters.
-        """
-        self._queue.put(True)
+    def fetch_wait(self):
+        # update cwnd=None, sshreshold=None, which would be used for next ....
+        for _ in range(len(self.peers)):
+            d = self.tx_queue.get()
+            name = d['rx_name']
+            self.peers[name]["init_cwnd"] = d['cwnd']
+            self.peers[name]["init_sshreshold"] = d['sshreshold']
 
     def shutdown(self):
-        self._queue.put(False)
-        self._queue.join()
-        self.join()
+        pass

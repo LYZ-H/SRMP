@@ -1,11 +1,10 @@
 """ps-worker connection."""
 import logging
 import random
-import sys
-import time
-
 import yaml
+import socket
 from .conn import RxThread, TxThread
+from .conn_one import RxThread as RxThread_one, TxThread as TxThread_one
 from .interpolation import ConstantInterpolation, \
     ClockWeightedInterpolation, LossInterpolation
 
@@ -50,15 +49,18 @@ class psConfiguration:
     def get_divergence_threshold(self):
         return self.config['divergence_threshold']
 
-    def get_is_para(self):
-        return self.config['is_para']
+    def get_transmit_type(self):
+        return self.config['broadcast']
 
-    def get_bw(self):
-        return self.config['bw']
+    def get_protocal_type(self):
+        return self.config['udp']
+
+    def get_bandwidth(self):
+        return self.config['bandwidth']
 
 
 class psConnection:
-    def __init__(self, name, config_file):
+    def __init__(self, name, config_file, alr, feedback):
         self.name = name
         # The clock is used to keep track of the model's age in terms of
         # training samples trained so far (increase by 1 in update_send())
@@ -67,8 +69,12 @@ class psConnection:
         self.nodes = self.config.get_nodes()
         self.fetching = False
         self.fetch_probability = self.config.get_fetch_probability()
-        self.para = self.config.get_is_para()
-        self.bw = self.config.get_bw()
+        self.broadcast = self.config.get_transmit_type()
+        self.is_udp = self.config.get_protocal_type()
+        self.bandwidth = 1024 * self.config.get_bandwidth()
+
+        self.acceptable_loss_rate = alr
+        self.feedback = feedback
 
         # Initialize the list of peers
         self.peers = []
@@ -81,13 +87,6 @@ class psConnection:
                     self.peers += [node]
                     # Create the client/server threads
             timeout_ms = self.config.get_timeoutms()
-            self.rx = RxThread(self.me.host, self.me.port, timeout_ms)
-            self.rx.start()
-            self.tx = {}  # a tx thread for each worker
-            for peer in self.peers:
-                self.tx[peer.name] = TxThread(timeout_ms, self.me.name, self.para, self.bw)
-                self.tx[peer.name].add_peer(peer.name, peer.host, peer.port)
-                self.tx[peer.name].start()
 
         else:
             for node in self.nodes:
@@ -99,18 +98,65 @@ class psConnection:
 
                     # Create the client/server threads
             timeout_ms = self.config.get_timeoutms()
-            self.rx = RxThread(self.me.host, self.me.port, timeout_ms)
-            self.tx = TxThread(timeout_ms, self.me.name, False, self.bw)
-            # Add all the peers
+
+        if self.me.name == 'ps':
+            sock_one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_one.bind(('', self.me.port))
+
+            self.rx_one = RxThread_one(self.me.port,
+                                       channel_name=self.me.name,
+                                       bw_in_kbps=self.bandwidth,
+                                       local_host=self.me.host,
+                                       socket_one=sock_one)
+            self.rx_one.start()
+
+            self.tx = TxThread('tx',
+                               '239.0.0.1',
+                               5007,
+                               channel_name=self.me.name,
+                               bw_in_kbps=self.bandwidth,
+                               type=self.broadcast,
+                               acceptable_loss_rate=self.acceptable_loss_rate,
+                               local_port=self.me.port,
+                               is_udp=self.is_udp,
+                               socket_one=sock_one)
             for peer in self.peers:
-                self.add_peer(peer.name, peer.host, peer.port)
+                self.tx.add_peer(self.peers.index(peer) + 1, peer.name)
 
-            # Start the threads
+        else:
+            sock_one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.rx = RxThread('239.0.0.1',
+                               5007,
+                               channel_name=self.me.name,
+                               bw_in_kbps=self.bandwidth,
+                               socket_one=sock_one,
+                               acceptable_loss_rate=self.acceptable_loss_rate,
+                               feedback=self.feedback)
+
             self.rx.start()
-            self.tx.start()
 
-    def add_peer(self, name, host, port):
-        self.tx.add_peer(name, host, port)
+            self.tx_one = {}  # a tx thread for each worker
+            for peer in self.peers:
+                self.tx_one[peer.name] = TxThread_one(
+                    'tx',
+                    channel_name=self.me.name,
+                    bw_in_kbps=self.bandwidth,
+                    type=self.broadcast,
+                    acceptable_loss_rate=self.acceptable_loss_rate,
+                    is_udp=self.is_udp,
+                    socket_one=sock_one)
+
+                self.tx_one[peer.name].add_peer(
+                    'r{0}'.format(self.peers.index(peer) + 1),
+                    host=peer.host,
+                    port=peer.port)
+
+    def add_peer(self, id, name):
+
+        self.tx.add_peer(id, name)
+
+    def add_peer_one(self, name, host, port):
+        self.tx_one.add_peer(name, host, port)
 
     def remove_peer(self, name):
         self.tx.remove_peer(name)
@@ -118,7 +164,7 @@ class psConnection:
     def _bernouli_trial(self, probability):
         return random.random() < probability
 
-    def grad_send(self, grad, step):
+    def data_send(self, data, step):
         """Initiate an update to the cluster.
 
         Performs 2 things:
@@ -127,19 +173,13 @@ class psConnection:
         """
         # Serve the new parameters
         state = {'clock': self.clock, 'step': step, 'name': self.name}
-        self.tx.set_current_state(state, grad)
-
         if self._bernouli_trial(self.fetch_probability):
-            LOGGER.debug("update_send(): starting fetch parameters request")
             self.fetching = True
-            self.tx.fetch_send()
+            for peer in self.peers:
+                self.tx_one[peer.name].send_chunks(clock=self.clock,
+                                                   chunks=data)
         else:
             self.fetching = False
-
-    def ps_send_syn(self, peer, data):
-        state = {'clock': self.clock, 'name': self.name}
-        self.tx[peer.name].set_current_state(state, data)
-        self.tx[peer.name].fetch_send()
 
     def ps_send(self, parameters, peer_name):
         """ps sends updated paramters to the pionted worker
@@ -156,40 +196,34 @@ class psConnection:
         self.fetching = False
 
     def update_wait(self):
-        """Waits for the paramters from ps;
-           Waits for the gradients from workers
+        """Waits for the model paramters or gradients from ps, depending on the ps
         """
         if not self.fetching:
             return None, None
-        peer_state, peer_payload = self.rx.fetch_wait()
+
+        peer_state = self.rx.fetch_wait()
+
+        peer_grads = peer_state['chunks']
+        peer_clock = peer_state['clock']
+        peer_name = 'ps'
+
         self.fetching = False
         # There may be no peers listening
-        if peer_payload is None:
+        if peer_grads is None:
             return None, None
-
         # Increase the clock value
         self.clock += 1
-        peer_clock = peer_state['clock']
-        peer_name = peer_state['name']
-        # print("update_wait(): (clock={0}, peer_clock={1}, peer_name={2})".format(self.clock, peer_clock, peer_name))
-        LOGGER.debug("update_wait(): (clock=%s, peer_clock=%s, peer_name=%s)", self.clock, peer_clock, peer_name)
-        return peer_payload, peer_state
+
+        return peer_grads, peer_state
 
     def ps_sendToAll(self, parameters):
         """ps sends updated paramters to the pionted worker
         """
         # Serve the new parameters
         state = {'clock': self.clock, 'name': self.name}
-        for peer in self.peers:
-            self.tx[peer.name].set_current_state(state, parameters)
-            self.tx[peer.name].fetch_send()
-            # time.sleep(sys.getsizeof(parameters) / (2 * 1024 * 1024))
 
-    def ps_receive(self):
-        peer_state, peer_grads = self.rx.fetch_wait()
-        peer_clock = peer_state['clock']
-        peer_name = peer_state['name']
-        return peer_grads
+        self.tx.send_chunks(clock=self.clock,
+                            chunks=parameters)
 
     def ps_receiveAll(self):
         """
@@ -205,26 +239,31 @@ class psConnection:
             barrier[peer.name] = 0
 
         # check received models at last clock
+
         while True:
-            peer_state, peer_grads = self.rx.fetch_wait()
-            # There may be no peers listening
-            if peer_grads is None:
-                continue
+            try:
+                peer_state = self.rx_one.fetch_wait()
+                peer_grads = peer_state['chunks']
+                peer_clock = peer_state['clock']
+                peer_name = peer_state['name']
 
-            # time.sleep(sys.getsizeof(peer_grads) / (32 * 1024 * 1024))
+                # There may be no peers listening
+                if peer_grads is None:
+                    continue
 
-            peer_clock = peer_state['clock']
-            peer_name = peer_state['name']
-            LOGGER.debug("ps_receive(): (clock=%s, peer_clock=%s, peer_name=%s)", self.clock, peer_clock, peer_name)
-            # print("ps_receive(): (clock=%{0}, peer_clock=%{1}, peer_name=%{2})".format(self.clock, peer_clock, peer_name))
-            # check whether the peer is fake peer
-            if peer_name in barrier:
-                rev_list.append(peer_grads)
-                del barrier[peer_name]
+                LOGGER.debug(
+                    "ps_receive(): (clock=%s, peer_clock=%s, peer_name=%s)",
+                    self.clock, peer_clock, peer_name)
+                if peer_name in barrier:
 
-            # check whether all the peers' models are received at this clock
-            if len(barrier) == 0:
-                break
+                    rev_list.append(peer_grads)
+                    del barrier[peer_name]
+
+                # check whether all the peers' models are received at this clock
+                if len(barrier) == 0:
+                    break
+            except Exception as e:
+                print(e)
 
                 # Increase the clock value
         self.clock += 1
