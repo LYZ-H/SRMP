@@ -26,6 +26,8 @@ class P2MMSG:
     FIN = 6
 
     PRE_FB_FIN = 7
+    
+    FB_SYN = 8
 
     ENCODE_METHODS = {}
     DECODE_METHODS = {}
@@ -181,11 +183,21 @@ class P2MMSG:
         self.mtype = struct.unpack("!B", self.buf)[0]
 
     DECODE_METHODS[PRE_FB_FIN] = decode_pre_fb_fin
+    
+    def encode_fb_syn(self):
+        self.buf = struct.pack("!BI", self.mtype, self.clock)
+
+    ENCODE_METHODS[FB_SYN] = encode_fb_syn
+
+    def decode_fb_syn(self):
+        self.mtype, self.clock = struct.unpack("!BI", self.buf)
+
+    DECODE_METHODS[FB_SYN] = decode_fb_syn
 
 
 class P2PMSG:
-    MAX_SIZE = 150000
-    AVG_SIZE = 105000
+    MAX_SIZE = 15000
+    AVG_SIZE = 10500
 
     SYN = 1
     SYN_ACK = 2
@@ -197,6 +209,7 @@ class P2PMSG:
     CHUNK_FEEDBACK = 8
     PRE_FIN = 9
     PRE_FB_ACK = 10
+    FB_SYN_ACK = 11
     ENCODE_METHODS = {}
     DECODE_METHODS = {}
 
@@ -325,6 +338,18 @@ class P2PMSG:
         self.mtype, self.clock = struct.unpack("!BI", self.buf)
 
     DECODE_METHODS[SYN_ACK] = decode_syn_ack
+    
+    def encode_fb_syn_ack(self):
+        self.name_to_int()
+        self.buf = struct.pack("!BI", self.mtype, self.peer)
+
+    ENCODE_METHODS[FB_SYN_ACK] = encode_fb_syn_ack
+
+    def decode_fb_syn_ack(self):
+        self.mtype, self.peer = struct.unpack("!BI", self.buf)
+        self.int_to_name()
+    
+    DECODE_METHODS[FB_SYN_ACK] = decode_fb_syn_ack
 
     def encode_pre_fb_ack(self):
         self.name_to_int()

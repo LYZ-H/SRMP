@@ -243,7 +243,8 @@ def train(epoch):
         print(progress)
         test_loss, test_acc = None, None
         if batch_idx % 20 == 0:
-            test_loss, test_acc = fast_test(epoch)
+            pass
+            # test_loss, test_acc = fast_test(epoch)
 
         time4 = time.time()
         cal_time += (time4 - time3) + (time2 - time1)
@@ -252,13 +253,12 @@ def train(epoch):
         if batch_idx % 20 == 0:
             f = open("./result/{}.txt".format(args.state), "a")
             f.write("%s,%d,%d,%d,%s,%.3f,%.3f%%\n" %
-                    (args.state, epoch, batch_idx, ctime, args.name, test_loss,
-                     test_acc))
+                    (args.state, epoch, batch_idx, ctime, args.name, loss_mean,
+                     accuracy))
             f.close()
 
         # wait updated model parameters from ps
         conn.update_wait()
-
         net.train()
 
 
@@ -364,7 +364,7 @@ if __name__ == '__main__':
     else:
         conn.send_zero_grad(-1)
         conn.update_wait()
-        for epoch in range(start_epoch, start_epoch + 6):  # 60000):
+        for epoch in range(start_epoch, start_epoch + 10):  # 60000):
             train(epoch)
             #test(epoch)
         done()

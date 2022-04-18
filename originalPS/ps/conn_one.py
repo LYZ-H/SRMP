@@ -65,9 +65,13 @@ class RxProtocol:
         return time.time()
 
     def sendto(self, data, addr):
-        self.sem.acquire()
-        self.transport.sendto(data, addr)
-        self.sem.release()
+        if self.channel_name is None:
+            return self.transport.sendto(data, addr)
+        else:
+            self.sem.acquire()
+            assert self.sem.value == 0
+            self.transport.sendto(data, addr)
+            self.sem.release()
 
     def datagram_received(self, data, addr):
         reply = None

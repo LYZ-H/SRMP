@@ -38,9 +38,9 @@ def sys_shell(cmd):
 def run(
         client_num=5, 
         of_version='OpenFlow13',
-        bw=200,
+        bw=60,
         delay='1ms',
-        loss=30,
+        loss=20,
         mcast_ip = '239.0.0.1',
         #max_queue_size=1000,
     ):

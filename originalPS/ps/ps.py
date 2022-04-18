@@ -7,6 +7,7 @@ from .conn import RxThread, TxThread
 from .conn_one import RxThread as RxThread_one, TxThread as TxThread_one
 from .interpolation import ConstantInterpolation, \
     ClockWeightedInterpolation, LossInterpolation
+import time
 
 INTERPOLATION_METHODS = {
     'constant': ConstantInterpolation,
@@ -100,14 +101,16 @@ class psConnection:
             timeout_ms = self.config.get_timeoutms()
 
         if self.me.name == 'ps':
-            sock_one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock_one.bind(('', self.me.port))
+            sock_one_r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_one_t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_one_r.bind(('', self.me.port + 1))
+            sock_one_t.bind(('', self.me.port))
 
             self.rx_one = RxThread_one(self.me.port,
                                        channel_name=self.me.name,
                                        bw_in_kbps=self.bandwidth,
                                        local_host=self.me.host,
-                                       socket_one=sock_one)
+                                       socket_one=sock_one_r)
             self.rx_one.start()
 
             self.tx = TxThread('tx',
@@ -119,17 +122,18 @@ class psConnection:
                                acceptable_loss_rate=self.acceptable_loss_rate,
                                local_port=self.me.port,
                                is_udp=self.is_udp,
-                               socket_one=sock_one)
+                               socket_one=sock_one_t)
             for peer in self.peers:
                 self.tx.add_peer(self.peers.index(peer) + 1, peer.name)
 
         else:
-            sock_one = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_one_r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock_one_t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.rx = RxThread('239.0.0.1',
                                5007,
                                channel_name=self.me.name,
                                bw_in_kbps=self.bandwidth,
-                               socket_one=sock_one,
+                               socket_one=sock_one_r,
                                acceptable_loss_rate=self.acceptable_loss_rate,
                                feedback=self.feedback)
 
@@ -144,12 +148,12 @@ class psConnection:
                     type=self.broadcast,
                     acceptable_loss_rate=self.acceptable_loss_rate,
                     is_udp=self.is_udp,
-                    socket_one=sock_one)
+                    socket_one=sock_one_t)
 
                 self.tx_one[peer.name].add_peer(
                     'r{0}'.format(self.peers.index(peer) + 1),
                     host=peer.host,
-                    port=peer.port)
+                    port=peer.port + 1)
 
     def add_peer(self, id, name):
 
@@ -251,9 +255,7 @@ class psConnection:
                 if peer_grads is None:
                     continue
 
-                LOGGER.debug(
-                    "ps_receive(): (clock=%s, peer_clock=%s, peer_name=%s)",
-                    self.clock, peer_clock, peer_name)
+                
                 if peer_name in barrier:
 
                     rev_list.append(peer_grads)

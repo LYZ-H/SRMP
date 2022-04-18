@@ -18,6 +18,7 @@
 #
 """Async Client/Server implementation."""
 from copy import deepcopy
+import enum
 import logging
 import socket
 from collections import OrderedDict, deque
@@ -46,7 +47,7 @@ class RxProtocol:
                  channel_name=None,
                  bw_in_kbps=800 * 1024,
                  acceptable_loss_rate=0.0,
-                 feedback = 1):
+                 feedback=1):
         # def __init__(self, rx_queue, source_peer, channel_name=None, bw_in_kbps=800 * 1024):
         # all packets assgined with the same local port are handled by this protocol/protocol
         #super().__init__()
@@ -56,7 +57,7 @@ class RxProtocol:
         # self.source_peer = source_peer
 
         self.channel_name = channel_name
-        self.sem = posix_ipc.Semaphore(channel_name,
+        self.sem = posix_ipc.Semaphore('/a',
                                        flags=posix_ipc.O_CREAT,
                                        initial_value=1)
         self.bw_in_kbps = bw_in_kbps
@@ -64,8 +65,20 @@ class RxProtocol:
 
         self.fb_count = 1
         self.max_chunk_seq = 0
-        
+
         self.feedback = feedback
+
+        self.nodes = ['w1', 'w2', 'w3', 'w4', 'w5']
+
+        self.reced = 0
+
+        self.last_time = 0
+        
+        self.feedback_state = 0
+        
+        self.feedback_packet = None
+        
+        self.to_feed = 0
 
         # TODO: (maybe) support dynamicall join and leave in the future
         """
@@ -74,10 +87,12 @@ class RxProtocol:
         self.mcast_source = None
         self.join_timeout = 2
         """
+        _thread.start_new_thread( self.iter_feedback, () )
 
     def __del__(self):
-        self.sem.unlink()
-        #self.sem.close()
+        pass
+        # self.sem.unlink()
+        # self.sem.close()
 
     def connection_made(self, transport, transport_one):
         LOGGER.info('Protocol started!')
@@ -103,13 +118,14 @@ class RxProtocol:
     def sendto(self, data, addr):
         try:
             if self.channel_name is None:
-                return self.transport.sendto(data, addr)
+                return self.transport_one.sendto(data, addr)
             else:
                 self.sem.acquire()
-                self.transport.sendto(data, addr)
+                self.transport_one.sendto(data, addr)
                 self.sem.release()
         except Exception as e:
-            self.transport.sendto(data, addr)
+            print(e)
+            self.sendto(data, addr)
 
     def check_completed(self, addr):
         if self.buf[addr] != None:
@@ -120,7 +136,19 @@ class RxProtocol:
         result_int = int.from_bytes(a, byteorder="big") ^ int.from_bytes(
             b, byteorder="big")
         return result_int.to_bytes(max(len(a), len(b)), byteorder="big")
-
+    
+    def iter_feedback(self):
+        while True:
+            id = int(self.channel_name[1:]) - 1
+            addr = ('10.0.0.1', 46000 + id * 1000)
+            
+            if self.feedback_packet is not None and self.to_feed == 1:
+                
+                self.sendto(self.feedback_packet.tobytes(), addr)
+                time.sleep(10)
+        
+    
+    
     def datagram_received(self, data, addr):
 
         cur_time = self.get_cur_time()
@@ -135,7 +163,7 @@ class RxProtocol:
         reply = None
         reply_fin = None
         reply_feedback = None
-
+        self.reced += 1
         if addr not in self.buf and msg.mtype == 2:
             chunks = [None for _ in range(msg.total_chunk)]
             self.buf[addr] = dict(
@@ -150,13 +178,15 @@ class RxProtocol:
             # TODO: count the number of received chunk
         elif addr not in self.buf and msg.mtype == 6:
             reply_fin = P2PMSG(peer=self.channel_name,
-                              mtype=P2PMSG.FIN_ACK_MUL,
-                              clock=int(time.time()))
+                               mtype=P2PMSG.FIN_ACK_MUL,
+                               clock=int(time.time()))
+            self.to_feed = 2
 
         if addr in self.buf:
             ref = self.buf[addr]
             if self.buf[addr]['received'] / self.buf[addr][
                     'total'] >= 1 - self.acceptable_loss_rate and msg.mtype != 6:
+                # pass
                 reply = P2PMSG(
                     peer=self.channel_name,
                     mtype=P2PMSG.PRE_FIN,
@@ -166,7 +196,8 @@ class RxProtocol:
                 chunk_data = msg.chunk_data
                 chunk_seqs = msg.chunk_seqs
                 chunk_seq = msg.chunk_seq
-
+                if chunk_seq % 100 == 0:
+                    self.check_completed(addr)
                 if ref['chunks'][chunk_seq] is None:
                     ref['chunks'][chunk_seq] = chunk_data
                     ref['received'] += 1
@@ -177,21 +208,23 @@ class RxProtocol:
                         range(ref['max_received_chunk_seq'] + 1,
                               msg.chunk_seq))
                 reply = P2PMSG(peer=self.channel_name,
-                              mtype=P2PMSG.CHUNK_ACK,
-                              seq=msg.seq,
-                              chunk_seq=chunk_seq)
+                               mtype=P2PMSG.CHUNK_ACK,
+                               seq=msg.seq,
+                               chunk_seq=chunk_seq)
 
                 if self.feedback == 1:
+                    self.to_feed = 1
+
                     if msg.chunk_seq > self.max_chunk_seq:
                         self.max_chunk_seq = msg.chunk_seq
-                    # if msg.chunk_seq >= (self.max_chunk_seq / 4 * 3) and msg.chunk_seq // 1000 == self.fb_count:
-                    if msg.chunk_seq >= self.max_chunk_seq and msg.chunk_seq % 1000 == 0:
+                    if self.buf[addr]['received'] / self.buf[addr][
+                            'total'] >= (1 - self.acceptable_loss_rate) / 2 and (
+                                self.reced % 2000 == 0):
+                        self.last_time = time.time()
                         uncover = []
                         for i in range(0, self.max_chunk_seq):
                             if ref['chunks'][i] is not None:
-                                # chunk_data = xor(chunk_data, ref['chunks'][i])
-                                chunk_data = self.bitwise_xor_bytes(
-                                    chunk_data, ref['chunks'][i])
+                                pass
                             else:
                                 uncover.append(i)
                         if len(uncover) == 1:
@@ -204,14 +237,14 @@ class RxProtocol:
                                     ref['lost_chunks'].discard(chunk_seq)
                                 else:
                                     ref['lost_chunks'].update(
-                                        range(ref['max_received_chunk_seq'] + 1,
+                                        range(
+                                            ref['max_received_chunk_seq'] + 1,
                                             msg.chunk_seq))
                             else:
                                 LOGGER.debug(
                                     '# Debug, duplicated chunk... {0} from peer {1}'
                                     .format(msg.chunk_seq, addr))
-                        elif len(uncover) >= 40:
-                            print("x")
+                        elif len(uncover) >= 100:
                             chunk_seqs = uncover
                             reply_feedback = P2PMSG(
                                 peer=self.channel_name,
@@ -223,54 +256,45 @@ class RxProtocol:
                                 last_received_chunk_seq=chunk_seq,
                                 clock=int(time.time()),
                                 receiver_id=0)
-                            if self.channel_name == 'w2':
-                                addr = ('10.0.0.1', 42000)
-                                self.sendto(reply_feedback.tobytes(), addr)
-                            elif self.channel_name == 'w3':
-                                addr = ('10.0.0.1', 43000)
-                                self.sendto(reply_feedback.tobytes(), addr)
-                            elif self.channel_name == 'w4':
-                                addr = ('10.0.0.1', 44000)
-                                self.sendto(reply_feedback.tobytes(), addr)
-                            elif self.channel_name == 'w5':
-                                addr = ('10.0.0.1', 45000)
-                                self.sendto(reply_feedback.tobytes(), addr)
+                            self.feedback_packet = reply_feedback
+                            i = int(self.channel_name[1:]) - 1
+                            addr = ('10.0.0.1', 41000 + i * 1000)
+                            self.sendto(reply_feedback.tobytes(), addr)
+                            self.feedback_state += 1
 
                         self.fb_count += 1
 
                 self.buf[addr] = ref
-
+        
             elif msg.mtype == 6:
                 if addr in self.buf:
                     self.check_completed(addr)
                     self.rx_queue.put(self.buf.pop(addr))
                     gc.collect()
                 reply_fin = P2PMSG(peer=self.channel_name,
-                                  mtype=P2PMSG.FIN_ACK_MUL,
-                                  clock=int(time.time()))
-
+                                    mtype=P2PMSG.FIN_ACK_MUL,
+                                    clock=int(time.time()))
+                self.to_feed = 2
                 self.fb_count = 1
                 self.max_chunk_seq = 0
-
-        if self.channel_name == 'w1':
-            addr = ('10.0.0.1', 41000)
+        try:
             if reply_fin is not None:
+                id = int(self.channel_name[1:]) - 1
+                addr = ('10.0.0.1', 41000 + id * 1000)
                 self.sendto(reply_fin.tobytes(), addr)
             else:
-                self.sendto(reply.tobytes(), addr)
-            self.i += 1
-        elif self.channel_name == 'w2' and reply_fin is not None:
-            addr = ('10.0.0.1', 42000)
-            self.sendto(reply_fin.tobytes(), addr)
-        elif self.channel_name == 'w3' and reply_fin is not None:
-            addr = ('10.0.0.1', 43000)
-            self.sendto(reply_fin.tobytes(), addr)
-        elif self.channel_name == 'w4' and reply_fin is not None:
-            addr = ('10.0.0.1', 44000)
-            self.sendto(reply_fin.tobytes(), addr)
-        elif self.channel_name == 'w5' and reply_fin is not None:
-            addr = ('10.0.0.1', 45000)
-            self.sendto(reply_fin.tobytes(), addr)
+                id = int(self.channel_name[1:]) - 1
+                addr = ('10.0.0.1', 41000 + id * 1000)
+                if id == msg.receiver_id:
+                    if self.feedback_state == 0:
+                        self.feedback_state = 1
+                    if reply is not None:
+                        self.sendto(reply.tobytes(), addr)
+                else:
+                    self.feedback_state = 0
+        except Exception as e:
+            print(e)
+            pass
 
 
 
@@ -286,7 +310,7 @@ class RxThread(threading.Thread):
                  bw_in_kbps=800 * 1024,
                  socket_one=None,
                  acceptable_loss_rate=0.0,
-                 feedback = 1):
+                 feedback=1):
         super().__init__()
         #self.source_peer = source_peer
         self.mcast_grp = mcast_grp
@@ -312,7 +336,7 @@ class RxThread(threading.Thread):
             channel_name=self.channel_name,
             bw_in_kbps=self.bw_in_kbps,
             acceptable_loss_rate=self.acceptable_loss_rate,
-            feedback = self.feedback)
+            feedback=self.feedback)
         self.protocol.connection_made(self.sock, self.sock_one)
         self.running = True
         LOGGER.info("RxThread starts to receve data..... at %s",
@@ -332,14 +356,10 @@ class RxThread(threading.Thread):
         #self.protocol.send_join()
         # TODO: maybe support dynamically join in the future
         while self.running:
-            try:
-                data, addr = self.sock.recvfrom(P2MMSG.MAX_SIZE)
-                addr = ('10.0.0.1', 40000)
-                self.protocol.datagram_received(data, addr)
-                # set and check timeout
-            except Exception as e:
-                print('a4' + str(e))
-                pass
+            data, addr = self.sock.recvfrom(P2MMSG.MAX_SIZE)
+            addr = ('10.0.0.1', 40000)
+            self.protocol.datagram_received(data, addr)
+            # set and check timeout
             """
             if not self.protocol.joined:
                 self.protocol.check_join()
@@ -405,7 +425,7 @@ class TxProtocol:
         self.tx_queue = tx_queue
         self.channel_name = channel_name
         self.bw_in_kbps = bw_in_kbps
-        self.sem = posix_ipc.Semaphore(channel_name,
+        self.sem = posix_ipc.Semaphore('/a',
                                        flags=posix_ipc.O_CREAT,
                                        initial_value=1)
         if self.sem.value == 0:
@@ -495,6 +515,20 @@ class TxProtocol:
 
         self.recv = set()
 
+        self.nodes = ['w1', 'w2', 'w3', 'w4', 'w5']
+
+        self.node_index = 0
+
+        self.past_time = time.time()
+
+        self.pre_fin_arr = set()
+
+        self.reced = 0
+        
+        self.feedback_to_resend = queue.Queue()
+        
+        self.feedbacking = False
+
     def update_rtt(self, rtt_sample):
         # http://blough.ece.gatech.edu/4110/TCPTimers.pdf
         if self.rtt is None:
@@ -515,7 +549,8 @@ class TxProtocol:
         self.transmit()
 
     def __del__(self):
-        self.sem.unlink()
+        pass
+        # self.sem.unlink()
         # self.sem.close()
 
     def get_cur_time(self):
@@ -547,6 +582,7 @@ class TxProtocol:
                 # if self.tx_is_blocked:
                 #    self.tx_tokens.put(1)
         except Exception as e:
+            print(e)
             pass
         self.sent_yet_unacked.clear()
         self.transmit()
@@ -554,76 +590,93 @@ class TxProtocol:
     def chunk_to_feedback(self):
 
         total_peer = len(self.feedback_seq.keys())
-        chunk_total_feedback = set()
-        for chunks in self.feedback_seq.values():
-            chunk_total_feedback.update(chunks)
-
-        self.chunks_to_resend = set()
-        print(total_peer)
-        for chunk in chunk_total_feedback:
-            i = 0
+        if len(self.pre_fin_arr) == 0:
+            chunk_total_feedback = set()
             for chunks in self.feedback_seq.values():
-                if chunk in chunks:
-                    i += 1
-                if i >= total_peer - 4:
-                    self.chunks_to_resend.add(chunk)
-        for i, seq in enumerate(self.chunks_to_resend):
-            if i % 50 == 0:
-                time.sleep(0.001)
-            msg = P2MMSG(
-                mtype=P2MMSG.CHUNK,
-                clock=int(time.time()),
-                total_chunk=self.total_chunk_num,
-                receiver_id=0,
-                seq=self.pkt_index,
-                chunk_seq=seq,
-                chunk_data=self.chunks[seq])
-            self.sendto(msg.tobytes(), self.addr)
+                chunk_total_feedback.update(chunks)
+
+            self.chunks_to_resend = set()
+            for chunk in chunk_total_feedback:
+                i = 0
+                for chunks in self.feedback_seq.values():
+                    if chunk in chunks:
+                        i += 1
+                    if i >= int(total_peer/2) - 1:
+                        self.chunks_to_resend.add(chunk)
+            self.feedback_seq = {}
+        else:
+            if total_peer >= 1:
+                chunk_total_feedback = set()
+                for chunks in self.feedback_seq.values():
+                    chunk_total_feedback.update(chunks)
+
+                self.chunks_to_resend = set()
+                for chunk in chunk_total_feedback:
+                    i = 0
+                    for chunks in self.feedback_seq.values():
+                        if chunk in chunks:
+                            i += 1
+                        if i >= 1:
+                            self.chunks_to_resend.add(chunk)
+                self.feedback_seq = {}
 
     def datagram_received(self, data, addr):
-        cur_time = self.get_cur_time()
+
         try:
             msg = P2PMSG(frombuffer=data)
         except Exception as e:
             print('a2' + str(e))
             LOGGER.info('message decode error mult: %s', str(e))
             return
+        cur_time = self.get_cur_time()
+        if cur_time - self.past_time >= 1:
+            # self.node_index = (self.node_index + 1) % 5
+            while True:
+                self.node_index = (self.node_index + 1) % 5
+                if not self.nodes[self.node_index] in self.pre_fin_arr:
 
-        if self.connection_stage == self.SENDING and msg.peer == 'w1':
+                    break
 
-            if msg.mtype == 9:
-                self.chunk_to_feedback()
-                self.connection_stage = self.FIN
-                self.perf_metrics['finish_time'] = cur_time
-            elif msg.mtype == 4:
+            self.past_time = cur_time
+
+        if self.connection_stage == self.SENDING and msg.peer == self.nodes[
+                self.node_index]:
+            
+            if msg.mtype == 4:
 
                 self.update_rtt_cc_cwnd_and_buf(msg)
 
-        elif self.connection_stage == self.SENDING:
-            if msg.CHUNK_FEEDBACK:
-                if msg.peer not in self.feedback_seq:
-                    self.feedback_seq[msg.peer] = set()
-                self.feedback_seq[msg.peer].update(set(msg.chunk_seqs))
+        if self.connection_stage == self.SENDING:
+            # if self.next_chunk_seq >= self.total_chunk_num and len(self.to_resend) == 0 and len(self.chunks_to_resend) == 0:
+            #     self.connection_stage = self.FIN
+            #     self.perf_metrics['finish_time'] = cur_time
+            if msg.mtype == 9:
+                self.pre_fin_arr.add(msg.peer)
+                # self.node_index = (self.node_index + 1) % 5
+                if len(self.pre_fin_arr) == len(self.nodes):
+                    self.connection_stage = self.FIN
+            elif msg.mtype == 8:
+                self.feedback_seq[msg.peer] = set(msg.chunk_seqs)
+                self.chunk_to_feedback()
 
         elif self.connection_stage == self.FIN:
-            if msg.FIN_ACK_MUL and msg.peer != 1:
-
+            if msg.mtype == 7:
                 self.fin_arr[int(msg.peer[1:]) - 1] = True
-
                 if not False in self.fin_arr:
                     self.connection_stage = self.COMPLETED
+                    self.perf_metrics['finish_time'] = cur_time
 
         elif self.connection_stage == self.COMPLETED:
             pass
         else:
             LOGGER.info('error meesage: %s', str(msg))
-        if (self.connection_stage == self.SENDING
-                and msg.peer == 'w1') or self.connection_stage != self.SENDING:
-            self.transmit()
+        self.transmit()
 
     def get_chunk_to_send(self):
-
-        if self.next_chunk_seq < self.total_chunk_num:
+        if len(self.chunks_to_resend) > 0:
+            seq = self.chunks_to_resend.pop()
+            chunk = self.chunks[seq]
+        elif self.next_chunk_seq < self.total_chunk_num:
             seq = self.next_chunk_seq
             chunk = self.chunks[seq]
             self.next_chunk_seq += 1
@@ -659,19 +712,21 @@ class TxProtocol:
             self.update_rtt(rtt_sample)
         # detect packet loss
         newly_to_resend = []
-        for seq, v in self.sent_yet_unacked.items():
-            if seq > acked_chunk_seq:
-                break
-            v['reorder_cnt'] += 1
-            if v['reorder_cnt'] >= self.LOSS_DETECT_THRESHOLD:
-                newly_to_resend.append(seq)
-        for seq in newly_to_resend:
-            try:
-                v = self.sent_yet_unacked.pop(seq)
-                self.to_resend[seq] = v
-            except KeyError:
-                pass
-
+        try:
+            for seq, v in self.sent_yet_unacked.items():
+                if seq > acked_chunk_seq:
+                    break
+                v['reorder_cnt'] += 1
+                if v['reorder_cnt'] >= self.LOSS_DETECT_THRESHOLD:
+                    newly_to_resend.append(seq)
+            for seq in newly_to_resend:
+                try:
+                    v = self.sent_yet_unacked.pop(seq)
+                    self.to_resend[seq] = v
+                except KeyError:
+                    pass
+        except Exception as e:
+            print(e)
         self.total_received_chunk_from_syn += 1
         # packet loss
         self.met_congestion = False
@@ -748,7 +803,7 @@ class TxProtocol:
                     mtype=P2MMSG.CHUNK,
                     clock=int(time.time()),
                     total_chunk=self.total_chunk_num,
-                    receiver_id=rid,
+                    receiver_id=self.node_index,
                     seq=self.pkt_index,
                     # chunk_seqs=self.sended,
                     chunk_seq=chunk_seq,
@@ -767,11 +822,15 @@ class TxProtocol:
 
                 self.pkt_index += 1
         elif self.connection_stage == self.FIN:
-            cur_time = self.get_cur_time()
-            # if self.last_fin_sent_time + self.rtt < cur_time:
-            fin_msg = P2MMSG(mtype=P2MMSG.FIN, clock=self.clock)
+            fin_msg = P2MMSG(mtype=P2MMSG.FIN,
+                              clock=self.clock)
+            
             self.sendto(fin_msg.tobytes(), self.addr)
-            # self.last_fin_sent_time = self.get_cur_time()
+            
+            # cur_time = self.get_cur_time()
+            # if self.last_fin_sent_time + self.rtt < cur_time:
+            #     self.sendto(fin_msg.tobytes(), self.addr)
+            #     self.last_fin_sent_time = self.get_cur_time()
 
     def is_active(self):
         return self.connection_stage != self.COMPLETED
@@ -883,15 +942,16 @@ class TxThread(threading.Thread):
                               acceptable_loss_rate=self.acceptable_loss_rate,
                               **self.conn_state)
         lock = _thread.allocate_lock()
+        self.sock.settimeout(protocol.rto)
         protocol.connection_made(self.sock,
                                  addr=(self.mcast_grp, self.mcast_port))
-        self.sock.settimeout(protocol.rto)
+        
 
         socket_recs = []
-        for i in range(41000, 46000, 1000):
+        for i in range(41000, 51000, 1000):
             sock_x = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock_x.bind(('', i))
-            sock_x.settimeout(protocol.rto)
+            sock_x.settimeout(0.1)
             socket_recs.append(sock_x)
 
         t_arr = []
@@ -904,6 +964,7 @@ class TxThread(threading.Thread):
 
         for t in t_arr:
             t.start()
+            
 
         while protocol.is_active():
 
